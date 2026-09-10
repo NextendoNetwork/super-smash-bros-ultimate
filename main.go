@@ -45,7 +45,8 @@ var (
 	nextendoSecret = loadNextendoSecret()
 	// requireAccount, when "1", rejects any login without a valid Nextendo token,
 	// keeping the closed-source test server private to account holders.
-	requireAccount = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
+	requireAccount  = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
+	requiredVersion = os.Getenv("NEXTENDO_REQUIRED_VERSION")
 )
 
 func main() {
@@ -177,6 +178,9 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 
 	// 1. Signed nx2 token → the account's PERSISTENT PID (+ online gates).
 	if pid, ok := nextendoPIDFromToken(username); ok {
+		if !versionOK(pid, extraData) {
+			return 0, nil, false
+		}
 		if allow, reason := nextendoOnlineCheck(pid, "ryujinx"); !allow {
 			fmt.Printf("[Auth] pid=%d online REFUSÉ (%s)\n", pid, reason)
 			return 0, nil, false
@@ -216,6 +220,9 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 			}
 			if requireSignedToken() && !(proven && provenPID == n) {
 				fmt.Printf("[Auth] pid=%d REFUSÉ : identité non prouvée (jeton nx2 signé requis)\n", n)
+				return 0, nil, false
+			}
+			if !versionOK(n, extraData) {
 				return 0, nil, false
 			}
 		}
@@ -348,4 +355,16 @@ func envOrInt(key string, def int) int {
 func requireSignedToken() bool {
 	v := os.Getenv("NEXTENDO_REQUIRE_SIGNED_TOKEN")
 	return v == "1" || v == "true"
+}
+
+func versionOK(pid uint64, extraData []byte) bool {
+	if requiredVersion == "" {
+		return true
+	}
+	got, ok := nex.TitleVersionFromLoginExtraData(extraData)
+	if !ok || got != requiredVersion {
+		fmt.Printf("[Auth] pid=%d online REFUSÉ (version=%q required=%q)\n", pid, got, requiredVersion)
+		return false
+	}
+	return true
 }
