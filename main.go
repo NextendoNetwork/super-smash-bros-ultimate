@@ -45,7 +45,8 @@ var (
 	nextendoSecret = loadNextendoSecret()
 	// requireAccount, when "1", rejects any login without a valid Nextendo token,
 	// keeping the closed-source test server private to account holders.
-	requireAccount = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
+	requireAccount  = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
+	requiredVersion = os.Getenv("NEXTENDO_REQUIRED_VERSION")
 )
 
 func main() {
@@ -78,7 +79,7 @@ func main() {
 		SecureStationURL: secureURL,
 		ServerName:       "Nextendo",
 		SessionKeyLength: sessionKeyLen,
-		ResolveUser:      resolveUser,
+		ResolveUserEx:    resolveUser,
 	}
 	authEndpoint.Register(nex.ProtocolTicketGranting, authCfg.Handler())
 	authEndpoint.OnRMC = logRMC("Auth")
@@ -167,7 +168,7 @@ func main() {
 // resolveUser maps a LoginEx username to an account. A valid "nx2." Nextendo
 // token resolves to its persistent PID; anything else gets a stable anonymous
 // PID derived from the username (so the same console keeps the same identity).
-func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
+func resolveUser(username string, extraData []byte) (uint64, []byte, uint32) {
 	// The source key encrypts the client ticket and is handed back as pSourceKey,
 	// so the console decrypts it. It MUST be 32 bytes (the Switch kerberos key
 	// size) — a 16-byte key makes the console reject the ticket. Derive it
@@ -177,11 +178,14 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 
 	// 1. Signed nx2 token → the account's PERSISTENT PID (+ online gates).
 	if pid, ok := nextendoPIDFromToken(username); ok {
+		if rc := versionResult(pid, extraData); rc != 0 {
+			return 0, nil, rc
+		}
 		if allow, reason := nextendoOnlineCheck(pid, "ryujinx"); !allow {
 			fmt.Printf("[Auth] pid=%d online REFUSÉ (%s)\n", pid, reason)
-			return 0, nil, false
+			return 0, nil, nex.ResultAuthTokenParseError
 		}
-		return pid, sourceKey, true
+		return pid, sourceKey, 0
 	}
 
 	// 2. Numeric username. The emulator's "Connexion Nextendo" button sends the
@@ -216,7 +220,10 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 			}
 			if requireSignedToken() && !(proven && provenPID == n) {
 				fmt.Printf("[Auth] pid=%d REFUSÉ : identité non prouvée (jeton nx2 signé requis)\n", n)
-				return 0, nil, false
+				return 0, nil, nex.ResultAuthTokenParseError
+			}
+			if rc := versionResult(n, extraData); rc != 0 {
+				return 0, nil, rc
 			}
 		}
 		pid, kind := n, "ryujinx"
@@ -229,27 +236,27 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 				fmt.Printf("[Auth] NSA %d -> account pid=%d\n", n, pid)
 			case nsaUnknown:
 				fmt.Printf("[Auth] NSA %d REFUSÉ (aucun compte Nextendo)\n", n)
-				return 0, nil, false
+				return 0, nil, nex.ResultAuthTokenParseError
 			case nsaUnreachable:
 				fmt.Printf("[Auth] NSA %d REFUSÉ (serveur compte injoignable)\n", n)
-				return 0, nil, false
+				return 0, nil, nex.ResultAuthTokenParseError
 			}
 		}
 		// GATES online : #6 e-mail vérifié + #5 un seul endroit + compte inconnu/désactivé.
 		if allow, reason := nextendoOnlineCheck(pid, kind); !allow {
 			fmt.Printf("[Auth] pid=%d online REFUSÉ (%s)\n", pid, reason)
-			return 0, nil, false
+			return 0, nil, nex.ResultAuthTokenParseError
 		}
-		return pid, sourceKey, true
+		return pid, sourceKey, 0
 	}
 
 	// 3. Anonymous / no Nextendo identity. When requireAccount is on, online REQUIRES
 	// a Nextendo account → reject (the game can't enter online mode).
 	if requireAccount {
 		fmt.Printf("[Auth] login anonyme REFUSÉ (compte Nextendo requis): %q\n", username)
-		return 0, nil, false
+		return 0, nil, nex.ResultAuthTokenParseError
 	}
-	return anonymousPID(username), sourceKey, true
+	return anonymousPID(username), sourceKey, 0
 }
 
 // revokedNexPayloads lists leaked nex_token payloads (pid.username.expiry) that must be
@@ -348,4 +355,32 @@ func envOrInt(key string, def int) int {
 func requireSignedToken() bool {
 	v := os.Getenv("NEXTENDO_REQUIRE_SIGNED_TOKEN")
 	return v == "1" || v == "true"
+}
+
+// versionResult returns 0 when the client may play, else the result code to reject it with.
+func versionResult(pid uint64, extraData []byte) uint32 {
+	if requiredVersion == "" {
+		return 0
+	}
+	got, ok := nex.TitleVersionFromLoginExtraData(extraData)
+	if !ok || got != requiredVersion {
+		fmt.Printf("[Auth] pid=%d online REFUSÉ (version=%q required=%q)\n", pid, got, requiredVersion)
+		return versionRejectResult()
+	}
+	return 0
+}
+
+// versionRejectResult picks the code an out-of-date client is refused with. Overridable
+// because which one yields the clearest on-screen message is a per-title question.
+func versionRejectResult() uint32 {
+	switch os.Getenv("NEXTENDO_VERSION_REJECT_CODE") {
+	case "unsupported":
+		return nex.ResultAuthUnsupportedVersion
+	case "clientold":
+		return nex.ResultAuthClientVersionIsOld
+	case "tokenparse":
+		return nex.ResultAuthTokenParseError
+	default:
+		return nex.ResultAuthApplicationVersionIsOld
+	}
 }
